@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/gorilla/mux"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -152,22 +150,77 @@ func (h *Handler) columnsSet(table string) (map[string]struct{}, error) {
 	return set, nil
 }
 
-func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	router := mux.NewRouter()
-	router.HandleFunc("/", h.GetTables).Methods("GET")
-	router.HandleFunc("/tables", h.GetTables).Methods("GET")
-	router.HandleFunc("/{table}", h.GetLimit).Methods("GET")
-	router.HandleFunc("/{table}/{id:[0-9]+}", h.GetOne).Methods("GET")
-	router.HandleFunc("/{table}", h.Create).Methods("PUT")
-	router.HandleFunc("/{table}/", h.Create).Methods("PUT")
-	router.HandleFunc("/{table}/{id:[0-9]+}", h.Update).Methods("POST", "PATCH")
-	router.HandleFunc("/{table}/{id:[0-9]+}", h.Delete).Methods("DELETE")
+func splitPath(r *http.Request) []string {
+	p := strings.Trim(r.URL.Path, "/")
+	if p == "" {
+		return nil
+	}
+	return strings.Split(p, "/")
+}
 
-	router.ServeHTTP(writer, request)
+func pathTable(r *http.Request) (string, bool) {
+	parts := splitPath(r)
+	if len(parts) < 1 {
+		return "", false
+	}
+	return parts[0], true
+}
+
+func pathTableID(r *http.Request) (string, int64, bool) {
+	parts := splitPath(r)
+	if len(parts) != 2 {
+		return "", 0, false
+	}
+	n, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	return parts[0], n, true
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r)
+
+	switch r.Method {
+	case http.MethodGet:
+		if len(parts) == 0 || parts[0] == "tables" {
+			h.GetTables(w, r)
+			return
+		}
+		if len(parts) == 1 {
+			h.GetLimit(w, r)
+			return
+		}
+		if len(parts) == 2 {
+			h.GetOne(w, r)
+			return
+		}
+	case http.MethodPut:
+		if len(parts) == 1 {
+			h.Create(w, r)
+			return
+		}
+	case http.MethodPost, http.MethodPatch:
+		if len(parts) == 2 {
+			h.Update(w, r)
+			return
+		}
+	case http.MethodDelete:
+		if len(parts) == 2 {
+			h.Delete(w, r)
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "unknown resource")
 }
 
 func (h *Handler) GetLimit(w http.ResponseWriter, r *http.Request) {
-	table := mux.Vars(r)["table"]
+	parts := splitPath(r)
+	if len(parts) < 1 {
+		writeError(w, http.StatusBadRequest, "invalid table name")
+		return
+	}
+	table := parts[0]
 
 	validName := regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString
 	if !validName(table) {
@@ -361,12 +414,10 @@ func (h *Handler) tableExists(table string) bool {
 }
 
 func (h *Handler) GetOne(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	table := vars["table"]
-	idStr := vars["id"]
-	pk := h.PK[table]
-	if pk == "" {
-		pk = "id"
+	table, id, ok := pathTableID(r)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "invalid id")
+		return
 	}
 
 	if !h.tableExists(table) {
@@ -374,11 +425,11 @@ func (h *Handler) GetOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil || id <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
+	pk := h.PK[table]
+	if pk == "" {
+		pk = "id"
 	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
@@ -454,7 +505,13 @@ func (h *Handler) GetOne(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
-	table := mux.Vars(r)["table"]
+	parts := splitPath(r)
+	if len(parts) < 1 {
+		writeError(w, http.StatusBadRequest, "invalid table name")
+		return
+	}
+	table := parts[0]
+
 	validName := regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString
 	if !validName(table) {
 		writeError(w, http.StatusBadRequest, "invalid table name")
@@ -609,9 +666,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	table := vars["table"]
-	idStr := vars["id"]
+	table, id, ok := pathTableID(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
 
 	if !h.tableExists(table) {
 		writeError(w, http.StatusNotFound, "unknown table")
@@ -620,11 +679,6 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	pk := h.PK[table]
 	if pk == "" {
 		pk = "id"
-	}
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil || id <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
 	}
 
 	var rec map[string]any
@@ -636,7 +690,6 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(ct, "application/json") {
 		var obj map[string]any
 		if err := json.Unmarshal(b, &obj); err != nil {
-			log.Printf("[U-DEC] json unmarshal err=%v; body=%q", err, string(b))
 			writeError(w, http.StatusBadRequest, "bad request")
 			return
 		}
@@ -758,9 +811,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	table := vars["table"]
-	idStr := vars["id"]
+	table, id, ok := pathTableID(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
 
 	if !h.tableExists(table) {
 		writeError(w, http.StatusNotFound, "unknown table")
@@ -772,11 +827,6 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		pk = "id"
 	}
 
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil || id <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
